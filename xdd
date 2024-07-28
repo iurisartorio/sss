@@ -1,0 +1,306 @@
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Timer=System.Windows.Forms.Timer;
+
+/// <summary>
+/// Based on the idea of http://www.jscreenfix.com
+/// </summary>
+public sealed partial class StuckPixelFixForm : Form
+{
+    [DllImport("user32.dll")]
+    static extern bool LockWindowUpdate(IntPtr hWndLock);
+
+    static readonly BlockingCollection<Bitmap> drawQ = new BlockingCollection<Bitmap>(2);
+    static readonly ThreadLocal<RndPixelFiller> filler = new ThreadLocal<RndPixelFiller>(() => new RndPixelFiller());      
+
+    static readonly Timer timer = new Timer { Interval = 10 };
+    static TimeStats stats = new TimeStats();
+    static ulong framesDisplayed = 0;
+
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        
+        //base.TopMost = true;
+        base.DoubleBuffered = true;
+        base.FormBorderStyle = FormBorderStyle.None;
+        base.WindowState = FormWindowState.Maximized;
+
+        new Thread(RunFramesRenderer) { IsBackground = true }.Start();
+        //Task.Factory.StartNew(RunFramesRenderer, TaskCreationOptions.LongRunning);
+
+        timer.Tick += OnTimerTick;
+        timer.Start();
+    }
+
+    protected override void OnActivated(EventArgs e)
+    {
+        Cursor.Hide();
+        timer.Start();
+    }
+
+    protected override void OnDeactivate(EventArgs e)
+    {
+        Cursor.Show();
+        timer.Stop();
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        base.OnClosed(e);
+        
+        const string f1 = @"ss\.fffff";
+        MessageBox.Show(this,
+            string.Join(Environment.NewLine,
+                "Frame rendering times:",
+                "Avg (s) = " + stats.Avg.ToString(f1),
+                "Min (s) = " + stats.Min.ToString(f1),
+                "Max (s) = " + stats.Max.ToString(f1),
+                string.Empty,
+                "Frames Per Second (FPS):",
+                "Avg = " + (1.0d / stats.Avg.TotalSeconds).ToString("F3"),
+                "Min = " + (1.0d / stats.Max.TotalSeconds).ToString("F3"),
+                "Max = " + (1.0d / stats.Min.TotalSeconds).ToString("F3"),
+                string.Empty,
+                "Summary:",
+                "App run time = " + (DateTime.UtcNow - Process.GetCurrentProcess().StartTime.ToUniversalTime()),
+                "Total frames rendered = " + stats.SamplesCount,
+                "Total frames displayed = " + framesDisplayed
+                ), Application.ProductName);
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == (Keys.Escape))
+        {
+            Close();
+            return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        if (drawQ.TryTake(out Bitmap frame))
+        {
+            e.Graphics.DrawImageUnscaled(frame, e.ClipRectangle);
+            ++framesDisplayed;
+        }
+    }
+
+    void OnTimerTick(object sender, EventArgs e)
+    {
+        LockWindowUpdate(Handle);
+        this.Refresh();
+        LockWindowUpdate(IntPtr.Zero);
+    }
+
+    void RunFramesRenderer()
+    {
+        var poolLength = drawQ.BoundedCapacity + 2;
+        var framesPool = Enumerable.Range(0, poolLength)
+            .Select(_ => new Bitmap(Width, Height)).ToArray();
+        var frameIndex = 0;
+        while (true)
+        {
+            drawQ.Add(RenderFrame(framesPool[frameIndex]));
+            frameIndex = (frameIndex + 1) % poolLength;
+        }
+    }
+
+    static Bitmap RenderFrame(Bitmap img)
+    {
+        var data = img.LockBits(new Rectangle(0, 0, img.Width, img.Height),
+            ImageLockMode.WriteOnly,
+            PixelFormat.Format32bppArgb);
+        try
+        {
+            stats.BeginSample();
+#if true // MT
+            FillNoiseMT(data);
+#else
+            FillNoiseST(data);
+#endif
+            stats.EndSample();
+        }
+        finally
+        {
+            img.UnlockBits(data);
+        }
+        return img;
+    }
+
+    static void FillNoiseST(BitmapData data)
+    {
+        filler.Value.FillBuffer(data.Scan0, data.Scan0 + data.Stride * data.Height);   
+    }
+
+    static void FillNoiseMT(BitmapData data)
+    {
+        var partitioner = Partitioner.Create(0, data.Height);
+        Parallel.ForEach(partitioner, (range, state) => 
+            filler.Value.FillBuffer(data.Scan0 + data.Stride * range.Item1, data.Scan0 + data.Stride * range.Item2)
+        );
+    }
+}
+
+// Adapted version of fast XorShift
+// https://bitbucket.org/rstarkov/demoxorshift/src/tip/Xorshift.cs?fileviewer=file-view-default
+sealed class RndPixelFiller
+{
+    static readonly uint[] pixels = Enumerable
+        .Range(0, 8 /* (2 ^ 3) RGB combinations */)
+        .Select(MaskToArgb).ToArray();
+
+    static uint MaskToArgb(int mask)
+    {
+        return ((mask & 4) == 4 ? 0xffff0000 : 0xff000000) |
+               ((mask & 2) == 2 ? 0xff00ff00 : 0xff000000) |
+               ((mask & 1) == 1 ? 0xff0000ff : 0xff000000);
+    }
+
+    uint _x = 123456789;
+    uint _y = 362436069;
+    uint _z = 521288629;
+    uint _w = 88675123;
+
+    public unsafe void FillBuffer(IntPtr start, IntPtr end)
+    {
+        uint* pbuf = (uint*)start;
+        uint* pend = (uint*)end;
+
+        uint* pendQuads = (pend - (pend - pbuf) % 4);
+        while (pbuf < pendQuads)
+        {
+            uint tx = _x ^ (_x << 11);
+            uint ty = _y ^ (_y << 11);
+            uint tz = _z ^ (_z << 11);
+            uint tw = _w ^ (_w << 11);
+            *(pbuf++) = pixels[(_x = _w ^ (_w >> 19) ^ (tx ^ (tx >> 8))) % 8];
+            *(pbuf++) = pixels[(_y = _x ^ (_x >> 19) ^ (ty ^ (ty >> 8))) % 8];
+            *(pbuf++) = pixels[(_z = _y ^ (_y >> 19) ^ (tz ^ (tz >> 8))) % 8];
+            *(pbuf++) = pixels[(_w = _z ^ (_z >> 19) ^ (tw ^ (tw >> 8))) % 8];
+        }
+
+        if (pbuf < pend)
+        {
+            uint t = _x ^ (_x << 11);
+            _x = _y; _y = _z; _z = _w;
+            t = _w = _w ^ (_w >> 19) ^ (t ^ (t >> 8));
+
+            while (true)
+            {
+                *(pbuf++) = pixels[(t & 0xFF) % 8];
+                if (pbuf == pend) break;
+                t >>= 8;
+            }
+        }
+    }
+    
+    /*public static unsafe void TestFill()
+    {
+        var b = new uint[7];
+        fixed (uint* pb = b)
+        {
+            var p = new IntPtr(pb);
+            new RndPixelFiller()
+                .FillBuffer(p, IntPtr.Add(p, b.Length * sizeof(uint)));
+        }
+    }*/
+}
+
+[DebuggerDisplay("Avg = {Avg}, Max = {Max}, Min = {Min}, Cnt = {SamplesCount}")]
+public sealed class TimeStats
+{
+    private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+
+    public TimeSpan Max { get; private set; }
+    public TimeSpan Min { get; private set; }
+    public TimeSpan Avg { get; private set; }
+    public long SamplesCount { get; private set; }
+
+    public void BeginSample()
+    {
+        _stopwatch.Restart();
+    }
+
+    public TimeSpan EndSample()
+    {
+        var sample = _stopwatch.Elapsed;
+        AddSample(sample);
+        return sample;
+    }
+
+    public void Combine(TimeStats that)
+    {
+        if (that.SamplesCount == 0)
+        {
+            return;
+        }
+        if (this.SamplesCount == 0)
+        {
+            this.Max = that.Max;
+            this.Min = that.Min;
+            this.Avg = that.Avg;
+            this.SamplesCount = that.SamplesCount;
+        }
+        else
+        {
+            var totalSamplesCount = this.SamplesCount + that.SamplesCount;
+            this.Max = TimeSpan.FromTicks(Math.Max(this.Max.Ticks, that.Max.Ticks));
+            this.Min = TimeSpan.FromTicks(Math.Min(this.Min.Ticks, that.Min.Ticks));
+            this.Avg = TimeSpan.FromTicks((long)
+                    (this.Avg.Ticks * ((double)this.SamplesCount / totalSamplesCount)
+                    + that.Avg.Ticks * ((double)that.SamplesCount / totalSamplesCount))
+                );
+            this.SamplesCount = totalSamplesCount;
+        }
+    }
+
+    public static TimeStats operator +(TimeStats stats1, TimeStats stats2)
+    {
+        var combinedStats = new TimeStats();
+        combinedStats.Combine(stats1);
+        combinedStats.Combine(stats2);
+        return combinedStats;
+    }
+
+    public void AddSample(TimeSpan sample)
+    {
+        var samplesCount = ++SamplesCount;
+        if (samplesCount == 1)
+        {
+            Max = sample;
+            Min = sample;
+            Avg = sample;
+        }
+        else
+        {
+            Max = TimeSpan.FromTicks(Math.Max(Max.Ticks, sample.Ticks));
+            Min = TimeSpan.FromTicks(Math.Min(Min.Ticks, sample.Ticks));
+            Avg = TimeSpan.FromTicks((Avg.Ticks * (samplesCount - 1) + sample.Ticks) / samplesCount);
+        }
+    }
+}
+
+static class Program
+{
+    /// <summary>
+    /// The main entry point for the application.
+    /// </summary>
+    [STAThread]
+    static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        Application.Run(new StuckPixelFixForm());
+    }
+}
